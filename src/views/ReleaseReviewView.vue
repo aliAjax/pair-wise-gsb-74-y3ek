@@ -13,7 +13,7 @@ import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useReleaseQuery, useReleasesQuery } from '@/composables/useGovernanceQueries'
 import type { ReleaseApproval } from '@/models/domain'
-import { releaseReadiness } from '@/services/selectors'
+import { activeMigrationConfirmations, releaseReadiness } from '@/services/selectors'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
@@ -33,6 +33,24 @@ const release = computed(
 )
 const releases = computed(() => releasesQuery.data.value ?? store.data.releases)
 const readiness = computed(() => (release.value ? releaseReadiness(release.value, store.issues) : 0))
+
+// 只放行当前版本、未因契约更新作废的确认
+const activeMigrations = computed(() =>
+  release.value ? activeMigrationConfirmations(release.value) : [],
+)
+const invalidatedMigrations = computed(() =>
+  release.value
+    ? release.value.migrationConfirmations.filter((confirmation) => confirmation.invalidatedAt)
+    : [],
+)
+const invalidatedApprovals = computed(() =>
+  release.value ? release.value.approvals.filter((approval) => approval.invalidatedAt) : [],
+)
+const hasStaleGate = computed(
+  () =>
+    invalidatedApprovals.value.length > 0 ||
+    invalidatedMigrations.value.some((item) => item.status !== 'confirmed'),
+)
 
 const createVisible = ref(false)
 const migrationVisible = ref(false)
@@ -79,8 +97,21 @@ const createRelease = async (): Promise<void> => {
     await MessagePlugin.error('版本号、标题和事件范围不能为空')
     return
   }
-  const created = store.createRelease(createForm.version, createForm.title, createForm.eventIds)
-  releaseId.value = created.id
+  const outcome = store.createRelease(createForm.version, createForm.title, createForm.eventIds)
+  if (outcome.kind === 'duplicate') {
+    createVisible.value = false
+    releaseId.value = outcome.existing.id
+    await invalidate()
+    await MessagePlugin.warning(
+      `版本 ${createForm.version} 已由另一窗口提交，契约已更新，本次提交不再放行；处理记录已保留`,
+    )
+    return
+  }
+  if (outcome.kind === 'write_failed') {
+    await MessagePlugin.error(`写入失败，可刷新页面从暂存区恢复：${outcome.message}`)
+    return
+  }
+  releaseId.value = outcome.release.id
   createVisible.value = false
   await invalidate()
   await MessagePlugin.success('发布候选已创建，已生成下游迁移清单')
@@ -90,7 +121,7 @@ const openMigration = (confirmationId: string): void => {
   const confirmation = release.value?.migrationConfirmations.find(
     (item) => item.id === confirmationId,
   )
-  if (!confirmation) return
+  if (!confirmation || confirmation.invalidatedAt) return
   migrationForm.confirmationId = confirmationId
   migrationForm.reviewer = confirmation.reviewer
   migrationForm.note = confirmation.note
@@ -162,12 +193,22 @@ const batchApprove = async (): Promise<void> => {
 
 const publish = async (): Promise<void> => {
   if (!release.value) return
-  if (!store.publishRelease(release.value.id)) {
-    await MessagePlugin.error('迁移确认或四角色审批尚未完成，当前不可发布')
+  const outcome = store.publishRelease(release.value.id)
+  await invalidate()
+  if (outcome.kind === 'published') {
+    await MessagePlugin.success('事件契约版本已发布')
     return
   }
-  await invalidate()
-  await MessagePlugin.success('事件契约版本已发布')
+  if (outcome.kind === 'duplicate') {
+    releaseId.value = outcome.existing.id
+    await MessagePlugin.warning('该版本已由另一窗口发布，本窗口不再重复放行')
+    return
+  }
+  if (outcome.kind === 'write_failed') {
+    await MessagePlugin.error(`写入失败，可刷新页面从暂存区恢复：${outcome.message}`)
+    return
+  }
+  await MessagePlugin.error(outcome.message)
 }
 
 const downloadDiff = (): void => {
@@ -230,6 +271,20 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
     </section>
 
     <template v-if="release">
+      <t-alert
+        v-for="notice in store.backfillNotices"
+        :key="notice"
+        theme="warning"
+        class="stale-alert"
+        :message="notice"
+      />
+      <t-alert
+        v-if="release.recalculatedAt && hasStaleGate"
+        theme="warning"
+        class="stale-alert"
+        :message="`契约已更新（${release.recalculationReason}）：差异、受影响依赖和迁移确认已重算，历史审批已作废，需要按当前版本重新确认与审批。`"
+      />
+
       <section class="release-overview">
         <div>
           <span>版本</span>
@@ -330,29 +385,40 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
             <div class="gate-row">
               <CheckCircleIcon
                 :class="{
-                  pending: release.migrationConfirmations.some((item) => item.status !== 'confirmed'),
+                  pending: activeMigrations.some((item) => item.status !== 'confirmed'),
                 }"
               />
               <div>
                 <strong>下游迁移确认</strong>
                 <span>
-                  {{
-                    release.migrationConfirmations.filter((item) => item.status === 'confirmed').length
-                  }}/{{ release.migrationConfirmations.length }} 已确认
+                  {{ activeMigrations.filter((item) => item.status === 'confirmed').length
+                  }}/{{ activeMigrations.length }} 已确认
+                  <em v-if="invalidatedMigrations.length" class="stale-note">
+                    （{{ invalidatedMigrations.length }} 份旧确认已因契约更新作废）
+                  </em>
                 </span>
               </div>
             </div>
             <div class="gate-row">
               <CheckCircleIcon
-                :class="{ pending: release.approvals.some((item) => item.status !== 'approved') }"
+                :class="{
+                  pending: release.approvals.some(
+                    (item) => item.status !== 'approved' || item.invalidatedAt,
+                  ),
+                }"
               />
               <div>
                 <strong>四角色批量审批</strong>
                 <span>
-                  {{ release.approvals.filter((item) => item.status === 'approved').length }}/{{
-                    release.approvals.length
-                  }}
+                  {{
+                    release.approvals.filter(
+                      (item) => item.status === 'approved' && !item.invalidatedAt,
+                    ).length
+                  }}/{{ release.approvals.length }}
                   已通过
+                  <em v-if="invalidatedApprovals.length" class="stale-note">
+                    （{{ invalidatedApprovals.length }} 份旧审批已作废，需重新审批）
+                  </em>
                 </span>
               </div>
             </div>
@@ -372,13 +438,13 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
           </div>
           <div class="migration-list">
             <article
-              v-for="confirmation in release.migrationConfirmations"
+              v-for="confirmation in activeMigrations"
               :key="confirmation.id"
               class="migration-card"
             >
               <div>
                 <strong>{{ dependencyName(confirmation.dependencyId) }}</strong>
-                <span>{{ confirmation.reviewer || '未指定确认人' }}</span>
+                <span>{{ confirmation.reviewer || '未指定确认人' }} · 仅适用于 {{ confirmation.version }}</span>
               </div>
               <StatusTag :value="confirmation.status" />
               <p>{{ confirmation.note || '尚未填写迁移确认说明。' }}</p>
@@ -391,6 +457,27 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
                 确认迁移
               </t-button>
             </article>
+            <article
+              v-for="confirmation in invalidatedMigrations"
+              :key="confirmation.id"
+              class="migration-card migration-stale"
+            >
+              <div>
+                <strong>{{ dependencyName(confirmation.dependencyId) }}</strong>
+                <span>
+                  {{ confirmation.reviewer || '未指定确认人' }} ·
+                  {{ confirmation.invalidatedReason || '契约更新后旧确认已作废' }}
+                </span>
+              </div>
+              <t-tag theme="warning" variant="light">已作废</t-tag>
+              <p>{{ confirmation.note || '历史迁移确认记录已保留，但不再放行当前版本。' }}</p>
+            </article>
+            <div
+              v-if="activeMigrations.length === 0 && invalidatedMigrations.length === 0"
+              class="empty-state"
+            >
+              当前差异不影响下游依赖。
+            </div>
           </div>
         </section>
 
@@ -402,14 +489,18 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
             <label v-for="approval in release.approvals" :key="approval.id" class="approval-row">
               <t-checkbox
                 :value="selectedApprovalIds.includes(approval.id)"
-                :disabled="approval.status === 'approved'"
+                :disabled="approval.status === 'approved' && !approval.invalidatedAt"
                 @change="setApprovalChecked(approval.id, $event)"
               />
               <div>
                 <strong>{{ roleLabel(approval.role) }}</strong>
                 <span>{{ approval.actor }} · {{ approval.comment || '待填写意见' }}</span>
+                <span v-if="approval.invalidatedAt" class="stale-note">
+                  旧审批已作废：{{ approval.invalidatedReason }}，需按当前版本重新审批
+                </span>
               </div>
-              <StatusTag :value="approval.status" />
+              <t-tag v-if="approval.invalidatedAt" theme="warning" variant="light">已作废</t-tag>
+              <StatusTag v-else :value="approval.status" />
               <t-button variant="text" size="small" @click.prevent="openApproval(approval)">
                 审批
               </t-button>
@@ -500,6 +591,19 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
 </template>
 
 <style scoped>
+.stale-alert {
+  margin-bottom: 12px;
+}
+
+.stale-note {
+  color: #c46a00;
+  font-style: normal;
+}
+
+.migration-stale {
+  background: #fdf8f0;
+}
+
 .filter-panel {
   padding: 14px 16px;
 }

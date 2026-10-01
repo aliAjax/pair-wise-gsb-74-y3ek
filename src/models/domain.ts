@@ -91,11 +91,15 @@ export interface ContractDifference {
 export interface MigrationConfirmation {
   id: string
   dependencyId: string
+  /** 迁移确认只对该发布版本有效；契约重算后旧确认会被作废 */
   version: string
   status: 'pending' | 'confirmed' | 'rejected'
   reviewer: string
   note: string
   confirmedAt?: string
+  /** 指纹变化后被作废重算的确认，保留处理记录但不再放行 */
+  invalidatedAt?: string
+  invalidatedReason?: string
 }
 
 export interface ReleaseApproval {
@@ -105,6 +109,9 @@ export interface ReleaseApproval {
   status: 'pending' | 'approved' | 'rejected'
   comment: string
   createdAt?: string
+  /** 契约更新后旧审批作废的时间，作废后状态重置为 pending */
+  invalidatedAt?: string
+  invalidatedReason?: string
 }
 
 export interface ReleaseCandidate {
@@ -117,6 +124,11 @@ export interface ReleaseCandidate {
   differences: ContractDifference[]
   migrationConfirmations: MigrationConfirmation[]
   approvals: ReleaseApproval[]
+  /** 发布候选生成时的契约版本指纹，属性或平台规则变化即不匹配 */
+  contractFingerprint: string
+  /** 契约更新后差异与门禁重算的最近一次时间 */
+  recalculatedAt?: string
+  recalculationReason?: string
   createdAt: string
   publishedAt?: string
 }

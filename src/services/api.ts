@@ -6,7 +6,7 @@ import type {
   ValidationIssue,
 } from '@/models/domain'
 import { loadState } from '@/services/repository'
-import { validateGovernance } from '@/services/selectors'
+import { activeMigrationConfirmations, validateGovernance } from '@/services/selectors'
 
 export interface EventListFilters {
   keyword?: string
@@ -49,7 +49,11 @@ const localAdapter: AxiosAdapter = async (config) => {
       ).length,
       dependencyCount: state.dependencies.length,
       pendingMigrations:
-        currentRelease?.migrationConfirmations.filter((item) => item.status === 'pending').length ?? 0,
+        currentRelease
+          ? activeMigrationConfirmations(currentRelease).filter(
+              (item) => item.status === 'pending',
+            ).length
+          : 0,
       validationIssueCount: issues.length,
       criticalIssueCount: issues.filter((issue) => issue.severity === 'critical').length,
       currentRelease,

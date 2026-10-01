@@ -6,6 +6,7 @@ import type {
   GovernanceState,
   ReleaseCandidate,
 } from './domain'
+import { contractFingerprint } from '@/services/selectors'
 
 const events: EventDefinition[] = [
   {
@@ -787,6 +788,7 @@ const releases: ReleaseCandidate[] = [
     status: 'reviewing',
     eventIds: ['evt-001', 'evt-003', 'evt-005'],
     affectedDependencyIds: ['dep-001', 'dep-004', 'dep-005', 'dep-006'],
+    contractFingerprint: 'fp-pending',
     differences: [
       {
         eventId: 'evt-001',
@@ -882,6 +884,7 @@ const releases: ReleaseCandidate[] = [
     status: 'published',
     eventIds: ['evt-002', 'evt-004', 'evt-006'],
     affectedDependencyIds: ['dep-002', 'dep-003'],
+    contractFingerprint: 'fp-pending',
     differences: [],
     migrationConfirmations: [
       {
@@ -981,9 +984,10 @@ const audit: AuditEvent[] = [
   },
 ]
 
-export const createSeedState = (): GovernanceState => ({
-  events,
-  scenarios: [
+export const createSeedState = (): GovernanceState => {
+  const state: GovernanceState = {
+    events,
+    scenarios: [
     {
       id: 'scn-001',
       name: '下单支付主链路',
@@ -1023,7 +1027,11 @@ export const createSeedState = (): GovernanceState => ({
   ],
   dependencies,
   baselines,
-  releases,
+  releases: releases.map((release) =>
+    release.contractFingerprint === 'fp-pending'
+      ? { ...release, contractFingerprint: contractFingerprint({ events }, release.eventIds) }
+      : release,
+  ),
   deprecations: [
     {
       id: 'plan-001',
@@ -1052,4 +1060,7 @@ export const createSeedState = (): GovernanceState => ({
   ],
   audit,
   currentVersion: '2026.10.0',
-})
+  }
+
+  return state
+}

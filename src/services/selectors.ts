@@ -4,11 +4,14 @@ import type {
   EventProperty,
   EventVersionSnapshot,
   GovernanceState,
+  MigrationConfirmation,
+  ReleaseApproval,
   ReleaseCandidate,
   SampleValidationResult,
   Severity,
   ValidationIssue,
 } from '@/models/domain'
+import { createId } from '@/services/id'
 
 const NAMING_PATTERN = /^[a-z][a-z0-9_]{2,31}$/
 const normalize = (value: string): string =>
@@ -99,6 +102,149 @@ export const contractDifferences = (
       return compareEventContract(event, latestBaseline(state.baselines, eventId))
     })
     .filter((item): item is ContractDifference => Boolean(item))
+
+/**
+ * 计算发布候选事件范围的契约指纹：涵盖属性（名称/类型/必填/枚举）与平台规则
+ * （启用状态、触发时机、平台必填属性）。属性或平台规则一变，指纹即不匹配。
+ */
+export const contractFingerprint = (
+  state: Pick<GovernanceState, 'events'>,
+  eventIds: string[],
+): string => {
+  const payload = eventIds
+    .map((eventId) => state.events.find((event) => event.id === eventId))
+    .filter((event): event is EventDefinition => Boolean(event))
+    .map((event) => ({
+      key: event.key,
+      properties: event.properties
+        .filter((property) => !property.deletedAt)
+        .map((property) => [
+          property.name,
+          property.type,
+          property.required ? 1 : 0,
+          property.enumValues.slice().sort().join(','),
+        ]),
+      platformRules: event.platformRules
+        .map((rule) => [
+          rule.platform,
+          rule.enabled ? 1 : 0,
+          rule.trigger,
+          rule.requiredPropertyIds.slice().sort().join(','),
+        ])
+        .sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
+    }))
+  return stableHash(JSON.stringify(payload))
+}
+
+/** 32 位 FNV-1a，转成 8 位十六进制，用于本地契约指纹 */
+export const stableHash = (input: string): string => {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return `fp-${(hash >>> 0).toString(16).padStart(8, '0')}`
+}
+
+/** 只统计当前版本、未被作废的迁移确认 */
+export const activeMigrationConfirmations = (
+  release: ReleaseCandidate,
+): MigrationConfirmation[] =>
+  release.migrationConfirmations.filter(
+    (confirmation) =>
+      confirmation.version === release.version && !confirmation.invalidatedAt,
+  )
+
+export interface ReleaseRecalculationResult {
+  release: ReleaseCandidate
+  changed: boolean
+  affectedDependencyIds: string[]
+}
+
+/**
+ * 按当前契约重算发布候选：指纹不匹配时刷新差异、受影响依赖和迁移清单，
+ * 已通过的旧审批和已确认的旧迁移一律作废（保留记录但不再放行）。
+ */
+export const recalculateRelease = (
+  state: GovernanceState,
+  release: ReleaseCandidate,
+  reason: string,
+): ReleaseRecalculationResult => {
+  if (release.status !== 'reviewing') {
+    return { release, changed: false, affectedDependencyIds: release.affectedDependencyIds }
+  }
+  const fingerprint = contractFingerprint(state, release.eventIds)
+  if (fingerprint === release.contractFingerprint) {
+    return { release, changed: false, affectedDependencyIds: release.affectedDependencyIds }
+  }
+
+  const differences = contractDifferences(state, release.eventIds)
+  const affected = affectedDependencies(state, differences)
+  const now = new Date().toISOString()
+
+  const nextById = new Map(
+    release.migrationConfirmations.map((confirmation) => [confirmation.dependencyId, confirmation]),
+  )
+  const migrationConfirmations: MigrationConfirmation[] = affected.map((dependencyId) => {
+    const previous = nextById.get(dependencyId)
+    if (previous && previous.version === release.version && !previous.invalidatedAt) {
+      if (previous.status === 'confirmed') {
+        return {
+          ...previous,
+          status: 'pending',
+          invalidatedAt: now,
+          invalidatedReason: reason,
+        }
+      }
+      return previous
+    }
+    return {
+      id: previous?.id ?? createId('mig'),
+      dependencyId,
+      version: release.version,
+      status: 'pending',
+      reviewer:
+        previous?.reviewer ??
+        state.dependencies.find((dependency) => dependency.id === dependencyId)?.owner ??
+        '',
+      note: previous?.note ?? '',
+    }
+  })
+
+  release.migrationConfirmations.forEach((confirmation) => {
+    if (!affected.includes(confirmation.dependencyId) && !confirmation.invalidatedAt) {
+      migrationConfirmations.push({
+        ...confirmation,
+        status: 'pending',
+        invalidatedAt: now,
+        invalidatedReason: '契约更新后该依赖不再受影响',
+      })
+    }
+  })
+
+  const approvals = release.approvals.map((approval): ReleaseApproval =>
+    approval.invalidatedAt || approval.status === 'pending'
+      ? approval
+      : {
+          ...approval,
+          status: 'pending',
+          invalidatedAt: now,
+          invalidatedReason: reason,
+        },
+  )
+
+  const recalculated: ReleaseCandidate = {
+    ...release,
+    affectedDependencyIds: affected,
+    differences,
+    migrationConfirmations,
+    approvals,
+    contractFingerprint: fingerprint,
+    recalculatedAt: now,
+    recalculationReason: reason,
+  }
+  return { release: recalculated, changed: true, affectedDependencyIds: affected }
+}
 
 export const affectedDependencies = (
   state: GovernanceState,
@@ -333,12 +479,15 @@ export const releaseReadiness = (
   release: ReleaseCandidate,
   issues: ValidationIssue[],
 ): number => {
-  const migrationTotal = release.migrationConfirmations.length
-  const migrationDone = release.migrationConfirmations.filter(
+  const activeMigrations = activeMigrationConfirmations(release)
+  const migrationTotal = activeMigrations.length
+  const migrationDone = activeMigrations.filter(
     (item) => item.status === 'confirmed',
   ).length
   const approvalTotal = release.approvals.length
-  const approvalDone = release.approvals.filter((item) => item.status === 'approved').length
+  const approvalDone = release.approvals.filter(
+    (item) => item.status === 'approved' && !item.invalidatedAt,
+  ).length
   const issuePenalty = Math.min(
     40,
     issues.filter((issue) => release.eventIds.includes(issue.entityId)).length * 8,

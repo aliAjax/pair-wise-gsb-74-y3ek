@@ -6,6 +6,13 @@ import type {
   GovernanceState,
   ReleaseCandidate,
 } from './domain'
+import {
+  CURRENT_SCHEMA_VERSION,
+  eventContractFingerprint,
+  releaseScopeFingerprint,
+} from '@/services/contractVersion'
+
+const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 const events: EventDefinition[] = [
   {
@@ -731,7 +738,7 @@ const baselines: EventVersionSnapshot[] = [
     version: '2.1.0',
     createdAt: '2026-08-12T10:00:00+08:00',
     status: 'published',
-    properties: structuredClone(events[1]!.properties),
+    properties: clone(events[1]!.properties),
   },
   {
     id: 'base-003',
@@ -740,7 +747,7 @@ const baselines: EventVersionSnapshot[] = [
     createdAt: '2026-09-05T10:00:00+08:00',
     status: 'published',
     properties: [
-      ...structuredClone(events[2]!.properties.filter((property) => property.id !== 'prop-014')),
+      ...clone(events[2]!.properties.filter((property) => property.id !== 'prop-014')),
       {
         ...events[2]!.properties.find((property) => property.id === 'prop-014')!,
         type: 'string',
@@ -767,7 +774,7 @@ const baselines: EventVersionSnapshot[] = [
     version: '3.0.0',
     createdAt: '2026-08-02T10:00:00+08:00',
     status: 'published',
-    properties: structuredClone(events[3]!.properties),
+    properties: clone(events[3]!.properties),
   },
   {
     id: 'base-005',
@@ -775,7 +782,7 @@ const baselines: EventVersionSnapshot[] = [
     version: '1.3.0',
     createdAt: '2026-08-20T10:00:00+08:00',
     status: 'published',
-    properties: structuredClone(events[5]!.properties),
+    properties: clone(events[5]!.properties),
   },
 ]
 
@@ -796,6 +803,14 @@ const releases: ReleaseCandidate[] = [
         requiredChanges: ['order_id 必填规则仍需确认'],
         typeChanges: ['order_id: number → string'],
         enumChanges: [],
+        platformChanges: [
+          {
+            platform: 'web',
+            triggerChange: true,
+            requiredPropertyAdded: ['delivery_type'],
+            requiredPropertyRemoved: [],
+          },
+        ],
       },
       {
         eventId: 'evt-003',
@@ -805,6 +820,7 @@ const releases: ReleaseCandidate[] = [
         requiredChanges: [],
         typeChanges: ['page_no: string → number'],
         enumChanges: ['click_type 新增 keyboard'],
+        platformChanges: [],
       },
     ],
     migrationConfirmations: [
@@ -981,9 +997,44 @@ const audit: AuditEvent[] = [
   },
 ]
 
-export const createSeedState = (): GovernanceState => ({
-  events,
-  scenarios: [
+export const createSeedState = (): GovernanceState => {
+  // 发布基线携带平台规则快照，使平台触发规则变化同样可比较、可触发候选失效
+  const baselinesWithRules: EventVersionSnapshot[] = baselines.map((baseline) => {
+    const event = events.find((item) => item.id === baseline.eventId)
+    if (!event) return baseline
+    const platformRules = clone(event.platformRules)
+    if (baseline.eventId === 'evt-001') {
+      // 上一版 Web 端在支付完成后才上报，且未强制 delivery_type
+      const webRule = platformRules.find((rule) => rule.platform === 'web')
+      if (webRule) {
+        webRule.trigger = '支付完成回调后上报'
+        webRule.requiredPropertyIds = webRule.requiredPropertyIds.filter(
+          (propertyId) => propertyId !== 'prop-005',
+        )
+      }
+    }
+    return { ...baseline, platformRules }
+  })
+
+  // 事件固化当前契约指纹
+  const fingerprintedEvents: EventDefinition[] = events.map((event) => ({
+    ...event,
+    contractFingerprint: eventContractFingerprint(event),
+  }))
+
+  // 已结束发布的候选固化指纹；评审中的 rel-001 刻意不带指纹：
+  // 审计记录显示契约在候选创建与数据审批之后又被修订，首次打开评审窗口时必须失效重算，
+  // 旧审批（appr-001）与旧迁移确认（mig-002）归档但不能继续放行。
+  const currentScope = { events: fingerprintedEvents } as GovernanceState
+  const fingerprintedReleases: ReleaseCandidate[] = releases.map((release) =>
+    release.status === 'reviewing'
+      ? release
+      : { ...release, contractFingerprint: releaseScopeFingerprint(currentScope, release.eventIds) },
+  )
+
+  return {
+    events: fingerprintedEvents,
+    scenarios: [
     {
       id: 'scn-001',
       name: '下单支付主链路',
@@ -1022,8 +1073,8 @@ export const createSeedState = (): GovernanceState => ({
     },
   ],
   dependencies,
-  baselines,
-  releases,
+  baselines: baselinesWithRules,
+  releases: fingerprintedReleases,
   deprecations: [
     {
       id: 'plan-001',
@@ -1052,4 +1103,6 @@ export const createSeedState = (): GovernanceState => ({
   ],
   audit,
   currentVersion: '2026.10.0',
-})
+  schemaVersion: CURRENT_SCHEMA_VERSION,
+  }
+}

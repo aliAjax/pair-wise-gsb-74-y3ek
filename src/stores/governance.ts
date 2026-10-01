@@ -12,11 +12,21 @@ import type {
 } from '@/models/domain'
 import { createId, loadState, resetState, saveState } from '@/services/repository'
 import {
-  affectedDependencies,
-  contractDifferences,
   releaseReadiness,
   validateGovernance,
 } from '@/services/selectors'
+import {
+  eventContractFingerprint,
+  releaseScopeFingerprint,
+} from '@/services/contractVersion'
+import {
+  canPublishRelease,
+  createReleaseCandidate,
+  isReleaseOperable,
+  isReleaseWaitingRecompute,
+  recomputeRelease,
+  type CreateReleaseResult,
+} from '@/services/releaseWorkflow'
 
 export const useGovernanceStore = defineStore('governance', () => {
   const data = ref<GovernanceState>(loadState())
@@ -25,6 +35,7 @@ export const useGovernanceStore = defineStore('governance', () => {
   const issues = computed(() => validateGovernance(data.value))
 
   const persist = (): void => {
+    // 整份状态作为一个序列化负载原子提交，契约快照与依赖状态不会只写一半
     saveState(data.value)
     lastSavedAt.value = new Date().toISOString()
   }
@@ -46,16 +57,48 @@ export const useGovernanceStore = defineStore('governance', () => {
     })
   }
 
+  /**
+   * 属性或平台规则变化后，使覆盖该事件的评审中候选差异、受影响依赖、
+   * 迁移确认与审批全部失效，等待重算；旧审批不能继续放行。
+   */
+  const invalidateReleasesForEvent = (event: EventDefinition, reason: string): void => {
+    data.value.releases.forEach((release) => {
+      if (!isReleaseOperable(release) || !release.eventIds.includes(event.id)) return
+      if (!isReleaseWaitingRecompute(release, data.value)) return
+      release.invalidation = {
+        reason,
+        changedEventId: event.id,
+        changedEventKey: event.key,
+        at: new Date().toISOString(),
+      }
+    })
+  }
+
   const saveEvent = (event: EventDefinition): void => {
     const index = data.value.events.findIndex((item) => item.id === event.id)
-    const saved = { ...event, updatedAt: new Date().toISOString() }
+    const previous = index >= 0 ? data.value.events[index] : undefined
+    const saved: EventDefinition = {
+      ...event,
+      updatedAt: new Date().toISOString(),
+      contractFingerprint: eventContractFingerprint({ ...event }),
+    }
     if (index >= 0) {
       data.value.events[index] = saved
     } else {
       data.value.events.unshift(saved)
     }
+    if (previous) invalidateReleasesForEvent(saved, `事件 ${event.key} 契约内容更新，旧评审结果失效`)
     audit('event', event.id, index >= 0 ? '更新事件' : '创建事件', `${event.key} 契约已保存`)
     persist()
+  }
+
+  const touchEvent = (eventId: string, reason: string): EventDefinition | undefined => {
+    const event = data.value.events.find((item) => item.id === eventId)
+    if (!event) return undefined
+    event.updatedAt = new Date().toISOString()
+    event.contractFingerprint = eventContractFingerprint(event)
+    invalidateReleasesForEvent(event, reason)
+    return event
   }
 
   const saveProperty = (eventId: string, property: EventProperty): void => {
@@ -67,9 +110,14 @@ export const useGovernanceStore = defineStore('governance', () => {
     } else {
       event.properties.push(property)
     }
-    event.updatedAt = new Date().toISOString()
-    audit('property', property.id, index >= 0 ? '更新属性' : '新增属性', `${event.key}.${property.name}`)
-    persist()
+    const saved = touchEvent(eventId, `属性 ${property.name} 变更，候选差异与门禁结果失效待重算`)
+    audit(
+      'property',
+      property.id,
+      index >= 0 ? '更新属性' : '新增属性',
+      `${event.key}.${property.name}`,
+    )
+    if (saved) persist()
   }
 
   const deleteProperty = (eventId: string, propertyId: string): void => {
@@ -77,7 +125,7 @@ export const useGovernanceStore = defineStore('governance', () => {
     const property = event?.properties.find((item) => item.id === propertyId)
     if (!event || !property) return
     property.deletedAt = new Date().toISOString()
-    event.updatedAt = new Date().toISOString()
+    touchEvent(eventId, `属性 ${property.name} 删除，候选差异与门禁结果失效待重算`)
     audit('property', property.id, '标记删除', `${event.key}.${property.name} 进入删除兼容期`)
     persist()
   }
@@ -91,47 +139,46 @@ export const useGovernanceStore = defineStore('governance', () => {
     } else {
       event.platformRules.push(rule)
     }
-    event.updatedAt = new Date().toISOString()
-    audit('platform_rule', rule.id, index >= 0 ? '更新平台规则' : '新增平台规则', `${event.key}/${rule.platform}`)
+    touchEvent(eventId, `平台规则 ${rule.platform} 变更，候选差异与门禁结果失效待重算`)
+    audit(
+      'platform_rule',
+      rule.id,
+      index >= 0 ? '更新平台规则' : '新增平台规则',
+      `${event.key}/${rule.platform}`,
+    )
     persist()
   }
 
-  const createRelease = (version: string, title: string, eventIds: string[]): ReleaseCandidate => {
-    const differences = contractDifferences(data.value, eventIds)
-    const affected = affectedDependencies(data.value, differences)
-    const release: ReleaseCandidate = {
-      id: createId('rel'),
-      version,
-      title,
-      status: 'reviewing',
-      eventIds,
-      affectedDependencyIds: affected,
-      differences,
-      migrationConfirmations: affected.map((dependencyId) => ({
-        id: createId('mig'),
-        dependencyId,
-        version,
-        status: 'pending',
-        reviewer:
-          data.value.dependencies.find((dependency) => dependency.id === dependencyId)?.owner ?? '',
-        note: '',
-      })),
-      approvals: [
-        { id: createId('appr'), role: 'data', actor: '顾清', status: 'pending', comment: '' },
-        { id: createId('appr'), role: 'product', actor: '丁禾', status: 'pending', comment: '' },
-        { id: createId('appr'), role: 'client', actor: '江驰', status: 'pending', comment: '' },
-        { id: createId('appr'), role: 'qa', actor: '余安', status: 'pending', comment: '' },
-      ],
-      createdAt: new Date().toISOString(),
+  const createRelease = (version: string, title: string, eventIds: string[]): CreateReleaseResult => {
+    const result = createReleaseCandidate(data.value, version, title, eventIds)
+    if (result.release) {
+      audit(
+        'release',
+        result.release.id,
+        '创建发布候选',
+        `${version} 包含 ${eventIds.length} 个事件，影响 ${result.release.affectedDependencyIds.length} 个下游依赖`,
+      )
+    } else if (result.duplicateRecord && result.duplicateOf) {
+      audit(
+        'release',
+        result.duplicateRecord.id,
+        '重复版本提交',
+        `${version} 已由候选 ${result.duplicateOf.id} 先行放行，重复提交保留处理记录`,
+      )
     }
-    data.value.releases.unshift(release)
-    data.value.currentVersion = version
-    audit(
-      'release',
-      release.id,
-      '创建发布候选',
-      `${version} 包含 ${eventIds.length} 个事件，影响 ${affected.length} 个下游依赖`,
-    )
+    persist()
+    return result
+  }
+
+  /** 候选因契约更新失效后，评审窗口首次打开时按最新契约重算 */
+  const refreshStaleRelease = (releaseId: string): ReleaseCandidate | undefined => {
+    const release = data.value.releases.find((item) => item.id === releaseId)
+    if (!release || !isReleaseOperable(release)) return release
+    if (!isReleaseWaitingRecompute(release, data.value)) return release
+    const reason =
+      release.invalidation?.reason ?? '契约已更新，差异、受影响依赖与迁移确认按最新契约重算'
+    recomputeRelease(data.value, release, reason)
+    audit('release', release.id, '候选失效重算', `${release.version}：${reason}`)
     persist()
     return release
   }
@@ -144,7 +191,9 @@ export const useGovernanceStore = defineStore('governance', () => {
   ): void => {
     const release = data.value.releases.find((item) => item.id === releaseId)
     const confirmation = release?.migrationConfirmations.find((item) => item.id === confirmationId)
-    if (!confirmation) return
+    if (!release || !confirmation || !isReleaseOperable(release)) return
+    // 迁移确认只对当前版本指纹有效；候选已失效时必须先重算
+    if (isReleaseWaitingRecompute(release, data.value)) return
     confirmation.status = 'confirmed'
     confirmation.reviewer = reviewer
     confirmation.note = note
@@ -164,7 +213,9 @@ export const useGovernanceStore = defineStore('governance', () => {
   ): void => {
     const release = data.value.releases.find((item) => item.id === releaseId)
     const approval = release?.approvals.find((item) => item.role === role)
-    if (!approval) return
+    if (!release || !approval || !isReleaseOperable(release)) return
+    // 旧审批不能放行变更后的契约；候选失效后先重算再审批
+    if (isReleaseWaitingRecompute(release, data.value)) return
     approval.status = status
     approval.actor = actor
     approval.comment = comment
@@ -175,11 +226,13 @@ export const useGovernanceStore = defineStore('governance', () => {
 
   const publishRelease = (releaseId: string): boolean => {
     const release = data.value.releases.find((item) => item.id === releaseId)
-    if (!release) return false
+    if (!release || !canPublishRelease(release, data.value)) return false
+    // 最后一道保险：指纹与当前契约不一致绝不放行
+    if (release.contractFingerprint !== releaseScopeFingerprint(data.value, release.eventIds)) {
+      return false
+    }
     const readiness = releaseReadiness(release, issues.value)
-    const migrationsReady = release.migrationConfirmations.every((item) => item.status === 'confirmed')
-    const approvalsReady = release.approvals.every((item) => item.status === 'approved')
-    if (!migrationsReady || !approvalsReady || readiness < 90) return false
+    if (readiness < 90) return false
     release.status = 'published'
     release.publishedAt = new Date().toISOString()
     release.eventIds.forEach((eventId) => {
@@ -190,7 +243,8 @@ export const useGovernanceStore = defineStore('governance', () => {
           id: createId('base'),
           eventId,
           version: event.version,
-          properties: structuredClone(event.properties),
+          properties: JSON.parse(JSON.stringify(event.properties)),
+          platformRules: JSON.parse(JSON.stringify(event.platformRules)),
           createdAt: new Date().toISOString(),
           status: 'published',
         })
@@ -297,6 +351,7 @@ export const useGovernanceStore = defineStore('governance', () => {
     deleteProperty,
     savePlatformRule,
     createRelease,
+    refreshStaleRelease,
     confirmMigration,
     updateApproval,
     publishRelease,

@@ -9,6 +9,7 @@ import type {
   Severity,
   ValidationIssue,
 } from '@/models/domain'
+import { comparePlatformRules } from '@/services/contractVersion'
 
 const NAMING_PATTERN = /^[a-z][a-z0-9_]{2,31}$/
 const normalize = (value: string): string =>
@@ -77,6 +78,9 @@ export const compareEventContract = (
     if (!afterMap.has(property.id)) removedProperties.push(property.name)
   })
 
+  const activePlatformRules = event.platformRules
+  const platformChanges = comparePlatformRules(event, baseline?.platformRules, activePlatformRules)
+
   return {
     eventId: event.id,
     eventKey: event.key,
@@ -85,6 +89,7 @@ export const compareEventContract = (
     requiredChanges,
     typeChanges,
     enumChanges,
+    platformChanges,
   }
 }
 
@@ -104,8 +109,13 @@ export const affectedDependencies = (
   state: GovernanceState,
   differences: ContractDifference[],
 ): string[] => {
-  const changedPropertyNames = new Set<string>()
+  // eventId -> 受属性层面变化影响的属性名集合
+  const changedPropertyNamesByEvent = new Map<string, Set<string>>()
+  // 平台启用状态或触发时机变化时，该事件的所有下游引用都受影响
+  const eventWidePlatformEvents = new Set<string>()
+
   differences.forEach((difference) => {
+    const changed = new Set<string>()
     ;[
       ...difference.addedProperties,
       ...difference.removedProperties,
@@ -113,18 +123,41 @@ export const affectedDependencies = (
       ...difference.typeChanges.map((item) => item.split(':')[0] ?? ''),
       ...difference.enumChanges.map((item) => item.split(':')[0] ?? ''),
     ].forEach((name) => {
-      if (name) changedPropertyNames.add(name)
+      if (name) changed.add(name)
     })
+
+    difference.platformChanges.forEach((platformChange) => {
+      platformChange.requiredPropertyAdded.forEach((name) => changed.add(name))
+      if (
+        platformChange.enabledChange !== undefined ||
+        platformChange.triggerChange === true
+      ) {
+        eventWidePlatformEvents.add(difference.eventId)
+      }
+    })
+
+    if (changed.size > 0) {
+      const existing = changedPropertyNamesByEvent.get(difference.eventId) ?? new Set<string>()
+      changed.forEach((name) => existing.add(name))
+      changedPropertyNamesByEvent.set(difference.eventId, existing)
+    }
   })
 
   return state.dependencies
-    .filter((dependency) =>
-      dependency.propertyRefs.some((reference) => {
+    .filter((dependency) => {
+      // 事件被依赖（eventIds）且发生平台启用/触发级变化时，该事件所有下游都受影响
+      const touchedEvents = dependency.eventIds.filter((eventId) =>
+        eventWidePlatformEvents.has(eventId),
+      )
+      if (touchedEvents.length > 0) return true
+      return dependency.propertyRefs.some((reference) => {
+        const changedNames = changedPropertyNamesByEvent.get(reference.eventId)
+        if (!changedNames || changedNames.size === 0) return false
         const event = state.events.find((item) => item.id === reference.eventId)
         const property = event?.properties.find((item) => item.id === reference.propertyId)
-        return Boolean(property && changedPropertyNames.has(property.name))
-      }),
-    )
+        return Boolean(property && changedNames.has(property.name))
+      })
+    })
     .map((dependency) => dependency.id)
 }
 

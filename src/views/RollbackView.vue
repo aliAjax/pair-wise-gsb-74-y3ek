@@ -166,10 +166,12 @@ const verify = async (): Promise<void> => {
           <t-select
             v-model="form.releaseId"
             :options="
-              store.data.releases.map((release) => ({
-                label: `${release.version} ${release.title}`,
-                value: release.id,
-              }))
+              store.data.releases
+                .filter((release) => !release.duplicateOf && release.status === 'published')
+                .map((release) => ({
+                  label: `${release.version} ${release.title}`,
+                  value: release.id,
+                }))
             "
           />
         </div>

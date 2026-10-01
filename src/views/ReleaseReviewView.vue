@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useQueryClient } from '@tanstack/vue-query'
 import {
   AddIcon,
@@ -7,12 +7,14 @@ import {
   ChevronRightIcon,
   CloseCircleIcon,
   DownloadIcon,
+  RefreshIcon,
 } from 'tdesign-icons-vue-next'
 import { MessagePlugin } from 'tdesign-vue-next'
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useReleaseQuery, useReleasesQuery } from '@/composables/useGovernanceQueries'
 import type { ReleaseApproval } from '@/models/domain'
+import { isReleaseOperable, isReleaseWaitingRecompute } from '@/services/releaseWorkflow'
 import { releaseReadiness } from '@/services/selectors'
 import { useGovernanceStore } from '@/stores/governance'
 
@@ -32,7 +34,25 @@ const release = computed(
     null,
 )
 const releases = computed(() => releasesQuery.data.value ?? store.data.releases)
-const readiness = computed(() => (release.value ? releaseReadiness(release.value, store.issues) : 0))
+const isStale = computed(
+  () => Boolean(release.value) && isReleaseWaitingRecompute(release.value!, store.data),
+)
+const operable = computed(() => Boolean(release.value) && isReleaseOperable(release.value!))
+const duplicateOwner = computed(() =>
+  release.value?.duplicateOf
+    ? store.data.releases.find((item) => item.id === release.value!.duplicateOf)
+    : undefined,
+)
+const readiness = computed(() =>
+  release.value && operable.value && !isStale.value
+    ? releaseReadiness(release.value, store.issues)
+    : 0,
+)
+
+const platformLabel = (platform: string): string =>
+  ({ web: 'Web', ios: 'iOS', android: 'Android', server: '服务端', miniprogram: '小程序' })[
+    platform
+  ] ?? platform
 
 const createVisible = ref(false)
 const migrationVisible = ref(false)
@@ -67,6 +87,24 @@ const invalidate = async (): Promise<void> => {
   await queryClient.invalidateQueries({ queryKey: ['lineage'] })
 }
 
+/**
+ * 候选首次打开或切换打开时：若契约已更新（含旧数据没有版本指纹），
+ * 按当前契约自动重算差异、受影响依赖与迁移确认；旧审批归档不再放行。
+ */
+watch(
+  release,
+  (current) => {
+    if (!current || !isReleaseWaitingRecompute(current, store.data)) return
+    store.refreshStaleRelease(current.id)
+    void invalidate().then(() => {
+      void MessagePlugin.warning(
+        `候选 ${current.version} 已按最新契约重算，旧审批与旧迁移确认失效`,
+      )
+    })
+  },
+  { immediate: true },
+)
+
 const openCreate = (): void => {
   createForm.version = `2026.${String(Number(store.data.currentVersion.split('.')[1] ?? 10) + 1).padStart(2, '0')}.0`
   createForm.title = ''
@@ -79,15 +117,34 @@ const createRelease = async (): Promise<void> => {
     await MessagePlugin.error('版本号、标题和事件范围不能为空')
     return
   }
-  const created = store.createRelease(createForm.version, createForm.title, createForm.eventIds)
-  releaseId.value = created.id
+  const result = store.createRelease(createForm.version, createForm.title, createForm.eventIds)
+  if (result.duplicateRecord && result.duplicateOf) {
+    releaseId.value = result.duplicateRecord.id
+    createVisible.value = false
+    await invalidate()
+    await MessagePlugin.warning(
+      `版本 ${createForm.version} 已由「${result.duplicateOf.title}」先行提交并进入评审，本次提交仅保留处理记录`,
+    )
+    return
+  }
+  if (result.release) {
+    releaseId.value = result.release.id
+  }
   createVisible.value = false
   await invalidate()
   await MessagePlugin.success('发布候选已创建，已生成下游迁移清单')
 }
 
+const recompute = async (): Promise<void> => {
+  if (!release.value) return
+  store.refreshStaleRelease(release.value.id)
+  await invalidate()
+  await MessagePlugin.warning('契约已更新，差异、受影响依赖与迁移确认已按最新契约重算，旧审批失效')
+}
+
 const openMigration = (confirmationId: string): void => {
-  const confirmation = release.value?.migrationConfirmations.find(
+  if (!release.value || isStale.value) return
+  const confirmation = release.value.migrationConfirmations.find(
     (item) => item.id === confirmationId,
   )
   if (!confirmation) return
@@ -110,10 +167,11 @@ const confirmMigration = async (): Promise<void> => {
   )
   migrationVisible.value = false
   await invalidate()
-  await MessagePlugin.success('下游迁移已确认')
+  await MessagePlugin.success('下游迁移已确认，仅对当前版本契约有效')
 }
 
 const openApproval = (approval: ReleaseApproval): void => {
+  if (isStale.value) return
   singleApproval.value = approval
   approvalComment.value = approval.comment
   approvalVisible.value = true
@@ -137,7 +195,7 @@ const submitApproval = async (status: ReleaseApproval['status']): Promise<void> 
 }
 
 const batchApprove = async (): Promise<void> => {
-  if (!release.value) return
+  if (!release.value || isStale.value) return
   if (selectedApprovalIds.value.length === 0 || !approvalComment.value.trim()) {
     await MessagePlugin.error('请选择审批项并填写批量审批意见')
     return
@@ -162,6 +220,10 @@ const batchApprove = async (): Promise<void> => {
 
 const publish = async (): Promise<void> => {
   if (!release.value) return
+  if (isStale.value) {
+    await MessagePlugin.error('契约已更新，请先重算候选后再发布')
+    return
+  }
   if (!store.publishRelease(release.value.id)) {
     await MessagePlugin.error('迁移确认或四角色审批尚未完成，当前不可发布')
     return
@@ -213,11 +275,18 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
           <span>发布候选</span>
           <t-select
             v-model="releaseId"
-            :options="releases.map((item) => ({ label: `${item.version} ${item.title}`, value: item.id }))"
+            :options="releases.map((item) => ({
+              label: `${item.duplicateOf ? '（重复提交）' : ''}${item.version} ${item.title}`,
+              value: item.id,
+            }))"
           />
         </div>
         <div class="filter-actions">
-          <t-button variant="outline" :disabled="!release" @click="downloadDiff">
+          <t-button
+            variant="outline"
+            :disabled="!release || !operable"
+            @click="downloadDiff"
+          >
             <template #icon><DownloadIcon /></template>
             导出差异
           </t-button>
@@ -229,7 +298,39 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
       </div>
     </section>
 
-    <template v-if="release">
+    <section v-if="release?.duplicateOf" class="panel duplicate-banner">
+      <CloseCircleIcon />
+      <div>
+        <strong>同一版本的重复提交，未参与发布放行</strong>
+        <p>{{ release.duplicateNote }}</p>
+        <p v-if="duplicateOwner" class="muted">
+          已放行候选：{{ duplicateOwner.version }} {{ duplicateOwner.title }}
+          （<StatusTag :value="duplicateOwner.status" />），提交于
+          {{ new Date(duplicateOwner.createdAt).toLocaleString('zh-CN') }}
+        </p>
+        <p class="muted">本记录提交于 {{ new Date(release.createdAt).toLocaleString('zh-CN') }}，保留事件范围：{{ release.eventIds.map(eventName).join('、') }}</p>
+      </div>
+    </section>
+
+    <section v-else-if="isStale" class="panel stale-banner">
+      <RefreshIcon />
+      <div>
+        <strong>契约已更新，当前候选的差异、受影响依赖与迁移确认已失效</strong>
+        <p>
+          {{ release?.invalidation?.reason ?? '属性或平台规则在上次评审后发生变化。' }}
+          <template v-if="release?.invalidation?.changedEventKey">
+            变更事件：{{ release.invalidation.changedEventKey }}
+          </template>
+          旧审批不再放行，请按最新契约重算后重新确认与审批。
+        </p>
+      </div>
+      <t-button theme="warning" @click="recompute">
+        <template #icon><RefreshIcon /></template>
+        按最新契约重算
+      </t-button>
+    </section>
+
+    <template v-if="release && !release.duplicateOf">
       <section class="release-overview">
         <div>
           <span>版本</span>
@@ -250,7 +351,7 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
         </div>
         <t-button
           theme="primary"
-          :disabled="release.status === 'published' || release.status === 'rolled_back'"
+          :disabled="!operable || isStale || release.status === 'published' || release.status === 'rolled_back'"
           @click="publish"
         >
           发布契约
@@ -297,12 +398,28 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
                     <li v-for="item in difference.requiredChanges" :key="item">{{ item }}</li>
                     <li v-for="item in difference.typeChanges" :key="item">{{ item }}</li>
                     <li v-for="item in difference.enumChanges" :key="item">{{ item }}</li>
+                    <li
+                      v-for="item in difference.platformChanges"
+                      :key="difference.eventId + '-' + item.platform"
+                      class="platform-diff"
+                    >
+                      {{ platformLabel(item.platform) }} 平台规则：
+                      <template v-if="item.enabledChange">{{ item.enabledChange }}；</template>
+                      <template v-if="item.triggerChange">触发时机变化；</template>
+                      <template v-if="item.requiredPropertyAdded.length">
+                        必填新增 {{ item.requiredPropertyAdded.join('、') }}；
+                      </template>
+                      <template v-if="item.requiredPropertyRemoved.length">
+                        必填移除 {{ item.requiredPropertyRemoved.join('、') }}；
+                      </template>
+                    </li>
                   </ul>
                   <span
                     v-if="
                       difference.requiredChanges.length === 0 &&
                       difference.typeChanges.length === 0 &&
-                      difference.enumChanges.length === 0
+                      difference.enumChanges.length === 0 &&
+                      difference.platformChanges.length === 0
                     "
                     class="muted"
                   >
@@ -321,7 +438,7 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
           </div>
           <div class="gate-list">
             <div class="gate-row">
-              <CheckCircleIcon />
+              <CheckCircleIcon :class="{ pending: isStale }" />
               <div>
                 <strong>契约差异已生成</strong>
                 <span>{{ release.differences.length }} 个事件参与比较</span>
@@ -330,11 +447,11 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
             <div class="gate-row">
               <CheckCircleIcon
                 :class="{
-                  pending: release.migrationConfirmations.some((item) => item.status !== 'confirmed'),
+                  pending: isStale || release.migrationConfirmations.some((item) => item.status !== 'confirmed'),
                 }"
               />
               <div>
-                <strong>下游迁移确认</strong>
+                <strong>下游迁移确认（仅当前版本有效）</strong>
                 <span>
                   {{
                     release.migrationConfirmations.filter((item) => item.status === 'confirmed').length
@@ -344,7 +461,7 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
             </div>
             <div class="gate-row">
               <CheckCircleIcon
-                :class="{ pending: release.approvals.some((item) => item.status !== 'approved') }"
+                :class="{ pending: isStale || release.approvals.some((item) => item.status !== 'approved') }"
               />
               <div>
                 <strong>四角色批量审批</strong>
@@ -355,6 +472,9 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
                   已通过
                 </span>
               </div>
+            </div>
+            <div v-if="isStale" class="stale-note">
+              契约指纹与当前不一致，门禁暂停，需先重算；旧审批与旧迁移确认保留在各自历史中但不放行。
             </div>
             <div class="readiness">
               <span>综合就绪度</span>
@@ -378,19 +498,33 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
             >
               <div>
                 <strong>{{ dependencyName(confirmation.dependencyId) }}</strong>
-                <span>{{ confirmation.reviewer || '未指定确认人' }}</span>
+                <span>{{ confirmation.reviewer || '未指定确认人' }} · 版本 {{ confirmation.version }}</span>
               </div>
-              <StatusTag :value="confirmation.status" />
+              <StatusTag :value="isStale ? 'pending' : confirmation.status" />
               <p>{{ confirmation.note || '尚未填写迁移确认说明。' }}</p>
+              <details v-if="confirmation.history && confirmation.history.length > 0" class="history-box">
+                <summary>历史确认记录（{{ confirmation.history.length }} 条，不对当前版本放行）</summary>
+                <ul>
+                  <li v-for="(record, index) in confirmation.history" :key="`${confirmation.id}-hist-${index}`">
+                    {{ record.version }} · {{ record.status === 'confirmed' ? '已确认' : '已驳回' }} ·
+                    {{ record.reviewer }} · {{ new Date(record.confirmedAt).toLocaleDateString('zh-CN') }}
+                    <span class="muted">失效原因：{{ record.reason }}</span>
+                    <span v-if="record.note" class="muted">说明：{{ record.note }}</span>
+                  </li>
+                </ul>
+              </details>
               <t-button
                 variant="outline"
                 size="small"
-                :disabled="confirmation.status === 'confirmed'"
+                :disabled="isStale || confirmation.status === 'confirmed'"
                 @click="openMigration(confirmation.id)"
               >
-                确认迁移
+                {{ isStale ? '契约已更新，待重算' : '确认迁移' }}
               </t-button>
             </article>
+            <div v-if="release.migrationConfirmations.length === 0" class="empty-state">
+              当前差异不影响已登记的下游依赖。
+            </div>
           </div>
         </section>
 
@@ -402,22 +536,33 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
             <label v-for="approval in release.approvals" :key="approval.id" class="approval-row">
               <t-checkbox
                 :value="selectedApprovalIds.includes(approval.id)"
-                :disabled="approval.status === 'approved'"
+                :disabled="isStale || approval.status === 'approved'"
                 @change="setApprovalChecked(approval.id, $event)"
               />
               <div>
                 <strong>{{ roleLabel(approval.role) }}</strong>
                 <span>{{ approval.actor }} · {{ approval.comment || '待填写意见' }}</span>
+                <details v-if="approval.history && approval.history.length > 0" class="history-box">
+                  <summary>历史审批（{{ approval.history.length }} 条，不对变更后契约放行）</summary>
+                  <ul>
+                    <li v-for="(record, index) in approval.history" :key="`${approval.id}-hist-${index}`">
+                      {{ record.status === 'approved' ? '已通过' : '已驳回' }} · {{ record.actor }} ·
+                      {{ record.createdAt ? new Date(record.createdAt).toLocaleDateString('zh-CN') : '' }}
+                      <span class="muted">失效原因：{{ record.reason }}</span>
+                      <span v-if="record.comment" class="muted">意见：{{ record.comment }}</span>
+                    </li>
+                  </ul>
+                </details>
               </div>
-              <StatusTag :value="approval.status" />
-              <t-button variant="text" size="small" @click.prevent="openApproval(approval)">
+              <StatusTag :value="isStale ? 'pending' : approval.status" />
+              <t-button variant="text" size="small" :disabled="isStale" @click.prevent="openApproval(approval)">
                 审批
               </t-button>
             </label>
           </div>
           <div class="batch-bar">
-            <t-input v-model="approvalComment" placeholder="批量审批意见" />
-            <t-button theme="primary" @click="batchApprove">批量通过</t-button>
+            <t-input v-model="approvalComment" :disabled="isStale" placeholder="批量审批意见" />
+            <t-button theme="primary" :disabled="isStale" @click="batchApprove">批量通过</t-button>
           </div>
         </section>
       </div>
@@ -502,6 +647,68 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
 <style scoped>
 .filter-panel {
   padding: 14px 16px;
+}
+
+.duplicate-banner,
+.stale-banner {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 14px 16px;
+}
+
+.duplicate-banner svg {
+  color: #c42d2d;
+}
+
+.stale-banner svg {
+  color: #c46a00;
+}
+
+.duplicate-banner p,
+.stale-banner p {
+  margin: 4px 0 0;
+  color: #5c6778;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.stale-note {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: #fdf3e7;
+  color: #a35a00;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.platform-diff {
+  color: #8a5a00;
+}
+
+.history-box {
+  margin-top: 4px;
+  font-size: 11px;
+}
+
+.history-box summary {
+  color: #8a4b4b;
+  cursor: pointer;
+}
+
+.history-box ul {
+  display: grid;
+  gap: 4px;
+  margin: 6px 0 0;
+  padding-left: 16px;
+}
+
+.history-box li {
+  display: grid;
+  gap: 2px;
+  line-height: 1.5;
 }
 
 .release-field {

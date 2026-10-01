@@ -10,6 +10,8 @@ const labels: Record<string, string> = {
   high: '高',
   medium: '中',
   low: '低',
+  duplicate: '重复提交',
+  stale: '契约已更新',
   draft: '草稿',
   reviewing: '评审中',
   approved: '已通过',
